@@ -1,80 +1,111 @@
-
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-from rdkit import Chem, DataStructs
-from rdkit.Chem import Mol, PandasTools, AllChem, Draw, rdMolDescriptors
-# from rdkit.Chem import MACCSkeys
+from rdkit import Chem, RDLogger
+import rdkit.Chem
 from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
-import sklearn
+from rdkit.Chem.AllChem import GetMorganFingerprint
 from sklearn.feature_extraction import DictVectorizer
 import numpy as np
-import cirpy
 import pandas as pd
 
-def generate_unhashed_fingerprints(data, radius=2):
+def generate_unhashed_count_fingerprint_column(data, radius=2):
     fps = []
-
-    # countSimulation=True → get a count-based (unhashed) fingerprint
-    fp_generator = GetMorganGenerator(
-        radius=radius,
-        countSimulation=True,           # ← this is key!
-        onlyNonzeroInvariants=True
-    )
 
     for smiles in data['SMILES_NEW']:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             fps.append({})
         else:
-            fp = fp_generator.GetCountFingerprint(mol)
+            fp = GetMorganFingerprint(mol, radius=radius, useCounts=True, useFeatures=False)
             fp_dict = dict(fp.GetNonzeroElements())
             fps.append(fp_dict)
     return fps
 
 
-def vectorize_fingerprints(fps_dicts):
-    vec = DictVectorizer(sparse=False)
-    X = vec.fit_transform(fps_dicts)
-    feature_names = vec.get_feature_names_out()
-    return pd.DataFrame(X, columns=feature_names), vec
+def create_uh_fps_dataframe(data, radius=2, vec_uh =None):
+    # Vectorizer learns to store the number of counts in the fingerprint from the training data.
+    # Using it this way allows the same vectorizer to be used on validation data
+    # The same number/position of counts will be obtained from the training data - without this the model cannot read validation dataset
 
-def create_unhashed_fingerprint_dataframe(data, radius=2):
-    fps_dicts = generate_unhashed_fingerprints(data, radius=radius)
-    X_df, vec = vectorize_fingerprints(fps_dicts)
+    uh_fps_dict = generate_unhashed_count_fingerprint_column(data, radius=radius)
+
+    if vec_uh is None:
+        vec_uh = DictVectorizer(sparse=False)
+        x = vec_uh.fit_transform(uh_fps_dict)
+    else:
+        x = vec_uh.transform(uh_fps_dict)
+
+    x_df = pd.DataFrame(x, columns=vec_uh.get_feature_names_out())
+    list_feat = vec_uh.get_feature_names_out()
+    print(list_feat)
 
     # Join with Ames labels
-    final_df = X_df.copy()
-    final_df['AMES'] = data['AMES'].values
-    return final_df, vec
+    final_uh_df = x_df.copy()
+    final_uh_df['AMES'] = data['AMES'].values
+    return final_uh_df, vec_uh
 
-def generate_unhashed_morgan_fingerprint_column(data, radius=2):
+
+def generate_hashed_count_fingerprint_column(data,radius=2, fp_length=2048):
+    hc_fps = []
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        fp_generator = GetMorganGenerator(
+            radius=radius,
+            fpSize=fp_length,
+            countSimulation=True
+        )
+
+        for smiles in data['SMILES_NEW']:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                hc_fps.append(np.nan)
+                print('turd')
+            else:
+                # Using a count fingerprint which is make into a dictionary.
+                # This is different from the unhashed count fingerprint because it has a fixed length.
+                fp = fp_generator.GetCountFingerprint(mol)
+                fp_dict = dict(fp.GetNonzeroElements())
+                hc_fps.append(fp_dict)
+
+    return hc_fps
+
+
+def create_hc_fps_dataframe(data, radius=2, vec_hc=None):
+    # Adding a vector argument to this function allows the same vectorizer to be used for multiple datasets
+    # This is essentially the same code as the previous vectorizer
+    # It needs its own function in case the hashed count fingerprint has a different number of items that need to go into the vector
+    hc_fps_dict = generate_hashed_count_fingerprint_column(data, radius=radius)
+
+    if vec_hc is None:
+        vec_hc = DictVectorizer(sparse=False)
+        x_hc = vec_hc.fit_transform(hc_fps_dict)
+    else:
+        x_hc = vec_hc.transform(hc_fps_dict)
+
+    x_hc_df = pd.DataFrame(x_hc, columns=vec_hc.get_feature_names_out())
+
+    # Join with Ames labels
+    final_hc_df = x_hc_df.copy()
+    final_hc_df['AMES'] = data['AMES'].values
+
+    return final_hc_df, vec_hc
+
+
+# The next three functions are pretty much the standard ones provided in the example.
+# They give the hashed, binary morgan fingerprint.
+def generate_hashed_binary_fingerprint_column(data,radius=2, fp_length=2048):
     smiles_list = data['SMILES_NEW'].tolist()
     fingerprints = []
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=DeprecationWarning)
-        for smiles in smiles_list:
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is None:
-                    fingerprints.append(np.nan)
-                else:
-                    # Unhashed fingerprint (sparse IntSparseIntVect)
-                    fp = rdMolDescriptors.GetMorganFingerprint(mol, radius)
-                    fingerprints.append(fp)
-            except ValueError:
-                fingerprints.append(np.nan)
+        fp_generator = GetMorganGenerator(
+            radius=radius,
+            fpSize=fp_length
+        )
 
-    data['UHFPS'] = fingerprints
-
-def generate_morg_fingerprint_column(data,radius=2, fp_length=2048):
-    smiles_list = data['SMILES_NEW'].tolist()
-    fingerprints = []
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        fp_generator = GetMorganGenerator(radius=radius, fpSize=fp_length)
         for smiles in smiles_list:
             try:
                 mol = Chem.MolFromSmiles(smiles)
@@ -90,10 +121,12 @@ def generate_morg_fingerprint_column(data,radius=2, fp_length=2048):
 
     data['FPS'] = fingerprints
 
+
 def fingerprints_to_bits(fp):
     return list(map(int, fp.ToBitString()))
 
-def create_fingerprint_dataframe(data):
+
+def create_hb_fingerprint_dataframe(data):
     # Convert fingerprints to lists of bits
     bit_lists = data['FPS'].apply(fingerprints_to_bits)
 
@@ -105,43 +138,63 @@ def create_fingerprint_dataframe(data):
 
     return bit_df
 
+
 def main():
+    RDLogger.DisableLog('rdApp.*')
+
+    # TRAINING data
     # Loading training data
-    ames_data = pd.read_csv("ames_mutagenicity_data_training.csv")
+    print('Let\'s arrange the training data!\n')
+    training_ames_data = pd.read_csv("clean_training_data.csv")
 
-    # Adding molecule column
-    PandasTools.AddMoleculeColumnToFrame(ames_data, smilesCol='SMILES_NEW', molCol='MOLECULE', includeFingerprints=False)
-    print(ames_data)
+    # UNHASHED + Count
+    training_data_uh = training_ames_data.copy()
+    training_data_uh_df, vec_uh = create_uh_fps_dataframe(training_data_uh)
+    print('Behold! The unhashed + count training dataset:\n',training_data_uh_df)
+    training_data_uh_df.to_csv("training_ames_data_uh.csv", index=False)
+    training_uh_fps_list = training_data_uh_df.columns.tolist()
 
-    # Checking if there are any bad molecules
-    next_mol_err = ames_data[ames_data['MOLECULE'].isna()].index.tolist()
-    print(len(next_mol_err))
+    # HASHED + Binary
+    training_data_hb = training_ames_data.copy()
+    generate_hashed_binary_fingerprint_column(training_data_hb)
+    training_data_hb_df = create_hb_fingerprint_dataframe(training_data_hb)
+    print('Behold! The hashed + binary training dataset:\n', training_data_hb_df)
+    training_data_hb_df.to_csv("training_ames_data_hb.csv", index=False)
 
-    # Making a hashed training dataframe with a fingerprint column and an AMES score column
-    ames_data_h = ames_data.copy()
-    generate_morg_fingerprint_column(ames_data_h)
-    new_ames_data_h = create_fingerprint_dataframe(ames_data_h)
-    new_ames_data_h.to_csv("ames_data_h_training.csv", index=False)
-    print(new_ames_data_h)
+    # HASHED + Count
+    training_data_hc = training_ames_data.copy()
+    training_data_hc_df, vec_hc = create_hc_fps_dataframe(training_data_hc)
+    print('Behold! The hashed + count training dataset:\n', training_data_hc_df)
+    training_data_hc_df.to_csv("training_ames_data_hc.csv", index=False)
 
-    # Making an unhashed training dataframe with a fingerprint column and an AMES score column
-    ames_data_uh = ames_data.copy()
-    ames_data_uh_df, vectorizer = create_unhashed_fingerprint_dataframe(ames_data_uh)
-    print(ames_data_uh_df)
-    ames_data_uh_df.to_csv("ames_data_uh_training.csv", index=False)
 
+    # VALIDATION data
     # Loading the validation dataset
-    val_ames_data = pd.read_csv("ames_w_smiles_external.csv")
+    print('Let\'s arrange the validation data!\n')
+    validation_ames_data = pd.read_csv("clean_validation_data.csv")
 
-    # Making an unhashed validation dataset
-    val_ames_data_df, vectorizer = create_unhashed_fingerprint_dataframe(val_ames_data)
-    print(val_ames_data_df)
-    val_ames_data_df.to_csv("ames_data_uh_validation.csv", index=False)
+    # UNHASHED + Count
+    validation_data_uh = validation_ames_data.copy()
+    validation_data_uh_df, _ = create_uh_fps_dataframe(validation_data_uh, vec_uh=vec_uh)
+    print('Behold! The unhashed + count validation dataset:\n', validation_data_uh_df)
+    validation_data_uh_df.to_csv("validation_ames_data_uh.csv", index=False)
+    validation_uh_fps_list = validation_data_uh_df.columns.tolist()
 
-    # Making a hashed validation dataset
-    generate_morg_fingerprint_column(val_ames_data)
-    val_ames_data_h = create_fingerprint_dataframe(val_ames_data)
-    val_ames_data_h.to_csv("ames_data_h_validation.csv", index=False)
+    # Sanity check
+    assert validation_uh_fps_list == training_uh_fps_list
+
+    # HASHED + Binary
+    validation_data_hb = validation_ames_data.copy()
+    generate_hashed_binary_fingerprint_column(validation_data_hb)
+    validation_data_hb_df = create_hb_fingerprint_dataframe(validation_data_hb)
+    print('Behold! The hashed + binary validation dataset:\n', validation_data_hb_df)
+    validation_data_hb_df.to_csv("validation_ames_data_hb.csv", index=False)
+
+    # HASHED + Count
+    validation_data_hc = validation_ames_data.copy()
+    validation_data_hc_df, _ = create_hc_fps_dataframe(validation_data_hc, vec_hc=vec_hc)
+    print('Behold! The hashed + count validation dataset:\n', validation_data_hc_df)
+    validation_data_hc_df.to_csv("validation_ames_data_hc.csv", index=False)
 
 
 if __name__ == "__main__":
